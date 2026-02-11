@@ -1,11 +1,11 @@
-# Run pip install sklearn-crfsuite
-# task_3.py
+# Run: pip install sklearn-crfsuite
+# Also ensure: pip install "datasets==3.6.0"
+
 import re
 from collections import Counter
 
 import numpy as np
 
-from utils import flatten_ner_sequences, token_accuracy, macro_f1_from_int_labels
 from data_utils import load_conll2003
 
 
@@ -16,9 +16,10 @@ from data_utils import load_conll2003
 _RE_HAS_DIGIT = re.compile(r".*\d.*")
 _RE_HAS_HYPHEN = re.compile(r".*-.*")
 
+
 def word_shape(w: str) -> str:
     """
-    Simple word shape: Xxxx, xxxx, ddd, etc.
+    Simple word shape: Xxxx, xxxx, ddd, etc. (compressed repeats)
     """
     out = []
     for ch in w:
@@ -30,12 +31,13 @@ def word_shape(w: str) -> str:
             out.append("d")
         else:
             out.append(ch)
-    # compress repeats
+
     shape = []
     for c in out:
         if not shape or shape[-1] != c:
             shape.append(c)
     return "".join(shape)
+
 
 def token_features(sent_tokens, i: int):
     w = sent_tokens[i]
@@ -68,7 +70,7 @@ def token_features(sent_tokens, i: int):
         "suf4": w_lower[-4:] if len(w_lower) >= 4 else w_lower,
     }
 
-    # context window: prev/next token lexical + a few shapes
+    # context window: prev/next token lexical + shapes
     if i == 0:
         feats["BOS"] = True
     else:
@@ -93,6 +95,7 @@ def token_features(sent_tokens, i: int):
 
     return feats
 
+
 def sent2features(tokens):
     return [token_features(tokens, i) for i in range(len(tokens))]
 
@@ -105,15 +108,15 @@ def dataset_to_xy(split, label_names):
     """
     Converts HF dataset split to (X, y) where:
       X = list of sentences, each is list[dict] features
-      y = list of sentences, each is list[int] labels
+      y = list of sentences, each is list[str] labels (CRFsuite requires strings)
     """
-    X = []
-    y = []
+    X, y = [], []
     for ex in split:
         tokens = ex["tokens"]
-        ner_tags = ex["ner_tags"]  # ints
+        ner_ids = ex["ner_tags"]  # ints from HF dataset
         X.append(sent2features(tokens))
-        y.append(list(ner_tags))
+        # IMPORTANT: convert ids -> label strings for pycrfsuite
+        y.append([label_names[t] for t in ner_ids])
     return X, y
 
 
@@ -121,11 +124,10 @@ def dataset_to_xy(split, label_names):
 # Train / Eval CRF
 # -----------------------------
 
-def train_crf(X_train, y_train, X_dev, y_dev):
+def train_crf(X_train, y_train, X_dev, y_dev, label_names):
     import sklearn_crfsuite
     from sklearn_crfsuite import metrics
 
-    # Light tuning candidates (keep it small)
     configs = [
         {"c1": 0.1, "c2": 0.1},
         {"c1": 0.05, "c2": 0.1},
@@ -146,11 +148,18 @@ def train_crf(X_train, y_train, X_dev, y_dev):
         crf.fit(X_train, y_train)
 
         y_pred = crf.predict(X_dev)
-        yt, yp = flatten_ner_sequences(y_dev, y_pred)
 
-        f1 = macro_f1_from_int_labels(yt, yp, num_classes=None)
-        acc = token_accuracy(yt, yp)
-        print(f"[dev] c1={cfg['c1']} c2={cfg['c2']}  acc={acc:.4f}  macroF1={f1:.4f}")
+        # Token accuracy + Macro-F1 on STRING labels
+        acc = metrics.flat_accuracy_score(y_dev, y_pred)
+        f1 = metrics.flat_f1_score(
+            y_dev,
+            y_pred,
+            average="macro",
+            labels=label_names,  # include all 9 labels, including "O"
+        )
+
+        print(
+            f"[dev] c1={cfg['c1']} c2={cfg['c2']}  acc={acc:.4f}  macroF1={f1:.4f}")
 
         if best is None or f1 > best[0]:
             best = (f1, cfg, crf)
@@ -164,47 +173,68 @@ def most_important_features(crf, top_n: int = 30):
     """
     Returns top features by absolute weight for state features.
     """
-    # sklearn-crfsuite exposes state_features_ / transition_features_
     state_items = list(crf.state_features_.items())  # ((attr, label), weight)
     state_items.sort(key=lambda x: abs(x[1]), reverse=True)
 
     top = state_items[:top_n]
-    # format
     out = []
     for (attr, label), w in top:
         out.append((attr, label, float(w)))
     return out
 
 
+def print_feature_inventory():
+    """
+    Explicitly list all features included (for your report).
+    """
+    feats = [
+        "bias",
+        "w", "w.lower",
+        "isupper", "istitle", "islower", "isdigit", "has_digit", "has_hyphen", "shape",
+        "pref1", "pref2", "pref3", "pref4",
+        "suf1", "suf2", "suf3", "suf4",
+        "BOS", "EOS",
+        "-1:w.lower", "-1:istitle", "-1:isupper", "-1:shape",
+        "+1:w.lower", "+1:istitle", "+1:isupper", "+1:shape",
+    ]
+    print("\nCRF Feature Set (inventory):")
+    for f in feats:
+        print(" -", f)
+
+
 def main():
+    from sklearn_crfsuite import metrics
+
     ds = load_conll2003()
 
     label_names = ds["train"].features["ner_tags"].feature.names
     num_labels = len(label_names)
     print("NER labels:", label_names)
 
+    print_feature_inventory()
+
     X_train, y_train = dataset_to_xy(ds["train"], label_names)
     X_dev, y_dev = dataset_to_xy(ds["validation"], label_names)
     X_test, y_test = dataset_to_xy(ds["test"], label_names)
 
-    crf, cfg = train_crf(X_train, y_train, X_dev, y_dev)
+    crf, cfg = train_crf(X_train, y_train, X_dev, y_dev, label_names)
 
     # Evaluate on test
     y_pred = crf.predict(X_test)
-    yt, yp = flatten_ner_sequences(y_test, y_pred)
 
-    acc = token_accuracy(yt, yp)
-    f1 = macro_f1_from_int_labels(yt, yp, num_classes=num_labels)
+    acc = metrics.flat_accuracy_score(y_test, y_pred)
+    f1 = metrics.flat_f1_score(
+        y_test, y_pred, average="macro", labels=label_names)
 
     print(f"\n[TEST] acc={acc:.4f}  macroF1={f1:.4f}")
 
-    # Feature importance
+    # Feature importance (state features)
     top_feats = most_important_features(crf, top_n=40)
     print("\nTop state features (by |weight|):")
     for attr, label, w in top_feats:
         print(f"{w:+.4f}\t{label}\t{attr}")
 
-    # You can also inspect transition features if you want:
+    # Optional: transition features
     # trans = list(crf.transition_features_.items())
     # trans.sort(key=lambda x: abs(x[1]), reverse=True)
     # print("\nTop transition features:")

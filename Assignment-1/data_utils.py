@@ -31,6 +31,7 @@ You’ll use it in Task 3 (CRF) and Task 4 (MLP).
 """
 # utils.py
 from __future__ import annotations
+from collections import defaultdict
 
 import re
 import math
@@ -259,63 +260,75 @@ def get_embedding_for_token(
 
 
 def build_cooccurrence_matrix(
-    documents: Iterable[List[str]],
+    docs_tok,
     vocab,
     window_size: int = 5,
-    lowercase: bool = True,
     symmetric: bool = True,
-    distance_weighting: bool = True,
+    distance_weighting: bool = False,
     dtype=np.float32,
-) -> sparse.csr_matrix:
+):
     """
-    Build word-word co-occurrence matrix X where X[i, j] counts contexts of j around i.
-    - Only counts tokens in provided vocab (OOV skipped) to comply with constraints.
-    - Supports optional distance weighting: 1 / distance.
+    Memory-safe co-occurrence builder.
+
+    Instead of constructing a huge COO with many duplicate (i,j) entries and then calling
+    sum_duplicates() (which can OOM), this aggregates counts in a dict keyed by (i,j).
     """
-    rows = []
-    cols = []
-    data = []
+    V = len(vocab.id_to_token)
+    w = int(window_size)
 
-    V = len(vocab)
+    # Map tokens to ids once per doc, and aggregate into dict
+    counts = defaultdict(float)  # (i, j) -> count
 
-    for doc in documents:
-        if not doc:
-            continue
+    unk_id = vocab.token_to_id.get("<UNK>", None)
 
-        toks = [t.lower() for t in doc] if lowercase else doc
-
-        # Map tokens to ids, skipping OOV (IMPORTANT for Task 1/2 compliance)
+    for doc in docs_tok:
+        # doc is list[str] tokens
+        # If docs_tok already contains only in-vocab tokens, unk_id won't be used.
         ids = []
-        for t in toks:
-            if vocab.has(t):
-                ids.append(vocab.get_id(t))
+        for t in doc:
+            tid = vocab.token_to_id.get(t)
+            if tid is None:
+                if unk_id is None:
+                    continue
+                tid = unk_id
+            ids.append(tid)
 
         n = len(ids)
-        for i in range(n):
-            wi = ids[i]
-            left = max(0, i - window_size)
-            right = min(n, i + window_size + 1)
+        for center in range(n):
+            i = ids[center]
+            left = max(0, center - w)
+            right = min(n, center + w + 1)
 
-            for j in range(left, right):
-                if j == i:
+            for ctx in range(left, right):
+                if ctx == center:
                     continue
-                wj = ids[j]
+                j = ids[ctx]
 
-                dist = abs(j - i)
-                val = (1.0 / dist) if (distance_weighting and dist > 0) else 1.0
+                if distance_weighting:
+                    dist = abs(ctx - center)
+                    weight = 1.0 / float(dist)
+                else:
+                    weight = 1.0
 
-                rows.append(wi)
-                cols.append(wj)
-                data.append(val)
-
+                counts[(i, j)] += weight
                 if symmetric:
-                    rows.append(wj)
-                    cols.append(wi)
-                    data.append(val)
+                    counts[(j, i)] += weight
 
-    X = sparse.coo_matrix((data, (rows, cols)), shape=(V, V), dtype=dtype)
+    # Convert dict to CSR sparse matrix
+    nnz = len(counts)
+    rows = np.empty(nnz, dtype=np.int32)
+    cols = np.empty(nnz, dtype=np.int32)
+    data = np.empty(nnz, dtype=dtype)
+
+    for k, ((i, j), v) in enumerate(counts.items()):
+        rows[k] = i
+        cols[k] = j
+        data[k] = v
+
+    X = sparse.csr_matrix((data, (rows, cols)), shape=(V, V), dtype=dtype)
+    # No huge duplicates exist now; sum_duplicates is cheap but optional
     X.sum_duplicates()
-    return X.tocsr()
+    return X
 
 
 """
@@ -623,4 +636,4 @@ def load_conll2003():
     Returns the DatasetDict.
     """
     from datasets import load_dataset
-    return load_dataset("conll2003")
+    return load_dataset("conll2003", trust_remote_code=True)

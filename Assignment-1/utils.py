@@ -1,5 +1,6 @@
 # utils.py
 from __future__ import annotations
+from collections import defaultdict
 
 import re
 import math
@@ -7,7 +8,6 @@ from dataclasses import dataclass
 from typing import Dict, List, Tuple, Iterable, Optional, Callable, Any
 from scipy import sparse
 import numpy as np
-
 
 
 # -----------------------------
@@ -106,7 +106,7 @@ def longest_affix_match(token: str, vocab: Vocab, min_len: int = 3) -> Optional[
             return pref
     # Try longest suffix
     for L in range(n, min_len - 1, -1):
-        suf = token[n - L :]
+        suf = token[n - L:]
         if vocab.has(suf):
             return suf
     return None
@@ -130,7 +130,7 @@ def subword_averaging_vector(
         if len(token) < n:
             continue
         for i in range(0, len(token) - n + 1):
-            grams.append(token[i : i + n])
+            grams.append(token[i: i + n])
             if len(grams) >= max_ngrams:
                 break
         if len(grams) >= max_ngrams:
@@ -199,7 +199,8 @@ def get_embedding_for_token(
     - If resolver returns -2 => random vector
     """
     if resolver is None:
-        resolver = OOVResolver(mode="unk", unk_token=vocab.unk_token or "<UNK>")
+        resolver = OOVResolver(
+            mode="unk", unk_token=vocab.unk_token or "<UNK>")
 
     idx = resolver.resolve_id(token, vocab)
     d = embedding_matrix.shape[1]
@@ -225,63 +226,76 @@ def get_embedding_for_token(
 
 
 def build_cooccurrence_matrix(
-    documents: Iterable[List[str]],
+    docs_tok,
     vocab,
     window_size: int = 5,
-    lowercase: bool = True,
     symmetric: bool = True,
-    distance_weighting: bool = True,
+    distance_weighting: bool = False,
     dtype=np.float32,
-) -> sparse.csr_matrix:
+):
     """
-    Build word-word co-occurrence matrix X where X[i, j] counts contexts of j around i.
-    - Only counts tokens in provided vocab (OOV skipped) to comply with constraints.
-    - Supports optional distance weighting: 1 / distance.
+    Memory-safe co-occurrence builder.
+
+    Instead of constructing a huge COO with many duplicate (i,j) entries and then calling
+    sum_duplicates() (which can OOM), this aggregates counts in a dict keyed by (i,j).
     """
-    rows = []
-    cols = []
-    data = []
+    V = len(vocab.id_to_token)
+    w = int(window_size)
 
-    V = len(vocab)
+    # Map tokens to ids once per doc, and aggregate into dict
+    counts = defaultdict(float)  # (i, j) -> count
 
-    for doc in documents:
-        if not doc:
-            continue
+    unk_id = vocab.token_to_id.get("<UNK>", None)
 
-        toks = [t.lower() for t in doc] if lowercase else doc
-
-        # Map tokens to ids, skipping OOV (IMPORTANT for Task 1/2 compliance)
+    for doc in docs_tok:
+        # doc is list[str] tokens
+        # If docs_tok already contains only in-vocab tokens, unk_id won't be used.
         ids = []
-        for t in toks:
-            if vocab.has(t):
-                ids.append(vocab.get_id(t))
+        for t in doc:
+            tid = vocab.token_to_id.get(t)
+            if tid is None:
+                if unk_id is None:
+                    continue
+                tid = unk_id
+            ids.append(tid)
 
         n = len(ids)
-        for i in range(n):
-            wi = ids[i]
-            left = max(0, i - window_size)
-            right = min(n, i + window_size + 1)
+        for center in range(n):
+            i = ids[center]
+            left = max(0, center - w)
+            right = min(n, center + w + 1)
 
-            for j in range(left, right):
-                if j == i:
+            for ctx in range(left, right):
+                if ctx == center:
                     continue
-                wj = ids[j]
+                j = ids[ctx]
 
-                dist = abs(j - i)
-                val = (1.0 / dist) if (distance_weighting and dist > 0) else 1.0
+                if distance_weighting:
+                    dist = abs(ctx - center)
+                    weight = 1.0 / float(dist)
+                else:
+                    weight = 1.0
 
-                rows.append(wi)
-                cols.append(wj)
-                data.append(val)
-
+                counts[(i, j)] += weight
                 if symmetric:
-                    rows.append(wj)
-                    cols.append(wi)
-                    data.append(val)
+                    counts[(j, i)] += weight
 
-    X = sparse.coo_matrix((data, (rows, cols)), shape=(V, V), dtype=dtype)
+    # Convert dict to CSR sparse matrix
+    nnz = len(counts)
+    rows = np.empty(nnz, dtype=np.int32)
+    cols = np.empty(nnz, dtype=np.int32)
+    data = np.empty(nnz, dtype=dtype)
+
+    for k, ((i, j), v) in enumerate(counts.items()):
+        rows[k] = i
+        cols[k] = j
+        data[k] = v
+
+    X = sparse.csr_matrix((data, (rows, cols)), shape=(V, V), dtype=dtype)
+    # No huge duplicates exist now; sum_duplicates is cheap but optional
     X.sum_duplicates()
-    return X.tocsr()
+    return X
+
 
 """
 Original co-occurrence builder without distance weighting, for reference:
@@ -347,6 +361,7 @@ def build_cooccurrence_matrix(
 # Nearest neighbors (cosine)
 # -----------------------------
 
+
 def l2_normalize_rows(mat: np.ndarray, eps: float = 1e-12) -> np.ndarray:
     norms = np.linalg.norm(mat, axis=1, keepdims=True)
     return mat / np.clip(norms, eps, None)
@@ -371,12 +386,14 @@ def top_k_cosine_neighbors(
     E = l2_normalize_rows(embeddings.astype(np.float32, copy=False))
 
     if resolver is None:
-        resolver = OOVResolver(mode="unk", unk_token=vocab.unk_token or "<UNK>")
+        resolver = OOVResolver(
+            mode="unk", unk_token=vocab.unk_token or "<UNK>")
 
     qid = resolver.resolve_id(query_word, vocab)
     if qid < 0:
         # If query is OOV and resolver returns zero/random sentinel, we can’t define neighbors well.
-        raise KeyError(f"Query word '{query_word}' not in vocab and cannot be resolved to an id.")
+        raise KeyError(
+            f"Query word '{query_word}' not in vocab and cannot be resolved to an id.")
 
     qvec = E[qid]
     sims = E @ qvec  # (|V|,)
@@ -413,7 +430,8 @@ def macro_f1_from_int_labels(y_true: List[int], y_pred: List[int], num_classes: 
         return 0.0
 
     if num_classes is None:
-        num_classes = int(max(max(y_true, default=0), max(y_pred, default=0)) + 1)
+        num_classes = int(max(max(y_true, default=0),
+                          max(y_pred, default=0)) + 1)
 
     # per-class TP/FP/FN
     tp = np.zeros((num_classes,), dtype=np.int64)
@@ -431,7 +449,8 @@ def macro_f1_from_int_labels(y_true: List[int], y_pred: List[int], num_classes: 
     for c in range(num_classes):
         precision = tp[c] / (tp[c] + fp[c]) if (tp[c] + fp[c]) > 0 else 0.0
         recall = tp[c] / (tp[c] + fn[c]) if (tp[c] + fn[c]) > 0 else 0.0
-        f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
+        f1 = (2 * precision * recall / (precision + recall)
+              ) if (precision + recall) > 0 else 0.0
         f1s.append(f1)
 
     return float(np.mean(f1s))
@@ -468,4 +487,4 @@ def set_global_seed(seed: int = 1337) -> None:
 
 def batch_iterable(xs: List[Any], batch_size: int) -> Iterable[List[Any]]:
     for i in range(0, len(xs), batch_size):
-        yield xs[i : i + batch_size]
+        yield xs[i: i + batch_size]
