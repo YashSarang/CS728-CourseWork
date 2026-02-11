@@ -68,7 +68,7 @@ In report: list all features and identify most important ones.
 
 For each embedding type (GloVe, SVD) and each dimension d:
 
-Handle OOV tokens (CoNLL tokens not in vocab) with a documented strategy: <UNK>, subword averaging, prefix match, etc.
+Handle OOV tokens (CoNLL tokens not in vocab) with a documented strategy: <UNK >, subword averaging, prefix match, etc.
 
 Train an MLP on (embedding → tag).
 

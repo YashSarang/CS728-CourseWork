@@ -1,0 +1,5 @@
+venv/
+Assignment-1/data/*
+models/
+logs/
+__pycache__/
