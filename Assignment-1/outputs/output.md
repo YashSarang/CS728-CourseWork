@@ -113,3 +113,10 @@ Top state features (by |weight|):
 +3.0111 I-LOC -1:w.lower:lord
 +3.0066 B-PER -1:w.lower:minister
 +2.9707 I-ORG -1:w.lower:mladost
+
+## Result
+
+RESULT: {'algo': 'svd', 'd': 300, 'oov_mode': 'affix', 'test_acc': 0.8253472596102078, 'test_macro_f1': 0.10320772534351698, 'best_dev_macro_f1': 0.10730401210399793}
+
+BEST OVERALL: {'algo': 'glove', 'd': 300, 'oov_mode': 'affix', 'test_acc': 0.8617206848282546, 'test_macro_f1': 0.3937023592717927, 'best_dev_macro_f1': 0.41428247802986434}
+Saved results to: assets\task4_mlp_results.csv
